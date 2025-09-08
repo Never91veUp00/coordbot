@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtualenv
+venv/
+.env
+
+# SQLite database
+*.db
+
+# VSCode / PyCharm
+.vscode/
+.idea/
