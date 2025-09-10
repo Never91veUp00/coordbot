@@ -1,10 +1,10 @@
-# tasks.py
 from aiogram import Bot, types
 from keyboards import ready_squads_keyboard, task_keyboard
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from utils import notify_admins, now_hm, update_user_status
+from asyncpg.exceptions import UniqueViolationError
 from db import is_admin
-from datetime import datetime
+from datetime import datetime, timedelta
 from enums import TaskStatus
 import db
 
@@ -24,28 +24,36 @@ async def task_cmd(message: types.Message):
 
 
 async def choose_target(callback: CallbackQuery):
-    """Админ выбрал отряд → вносим в pending"""
+    """Админ выбрал отряд → создаём pending"""
     if not await is_admin(callback.from_user.id):
         await callback.answer("Нет прав.")
         return
 
     target_uid = int(callback.data.split(":")[1])
-    assert db.DB is not None
+    row = await db.DB.fetchrow("SELECT u.squad FROM users u WHERE u.tg_id=$1", target_uid)
+    squad = row["squad"] if row else None
 
-    async with db.DB.execute("SELECT u.squad FROM users u WHERE u.tg_id=?", (target_uid,)) as cur:
-        row = await cur.fetchone()
-    squad = row[0] if row else None
+    try:
+        await db.DB.execute(
+            "INSERT INTO pending (admin_id, target_uid, squad, created_at) VALUES ($1, $2, $3, $4)",
+            callback.from_user.id, target_uid, squad, datetime.now().isoformat(timespec="seconds")
+        )
+    except UniqueViolationError:
+        await callback.message.answer(
+            f"⚠️ Отряду {squad} уже назначается задача другим админом. Подождите."
+        )
+        await callback.answer()
+        return
 
-    await db.DB.execute(
-        "INSERT INTO pending (admin_id, target_uid, squad, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (callback.from_user.id, target_uid, squad, datetime.now().isoformat(timespec="seconds"))
-    )
-    await db.DB.commit()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить назначение", callback_data="cancel_task")]
+    ])
 
     await callback.message.edit_text(
-        "✏ Введи цель в формате: `<точка> <цвет>`.",
-        parse_mode="Markdown"
+        "✏ Введи цель в формате:\n`<цифра> <цвет>`.\n\n"
+        "Или нажми «Отменить назначение».",
+        parse_mode="Markdown",
+        reply_markup=kb
     )
     await callback.answer()
 
@@ -56,17 +64,29 @@ async def handle_admin_task_message(message: types.Message, bot: Bot):
     if not text:
         return
 
-    async with db.DB.execute(
-        "SELECT p.id, p.target_uid, p.squad, p.point, p.color, p.is_edit "
-        "FROM pending p WHERE p.admin_id=? ORDER BY p.created_at DESC LIMIT 1",
-        (message.from_user.id,)
-    ) as cur:
-        row = await cur.fetchone()
-
+    row = await db.DB.fetchrow(
+        "SELECT id, target_uid, squad, point, color, is_edit, created_at "
+        "FROM pending WHERE admin_id=$1 ORDER BY created_at DESC LIMIT 1",
+        message.from_user.id
+    )
     if not row:
         return
 
-    pending_id, target_uid, squad, old_point, old_color, is_edit = row
+    pending_id, target_uid, squad = row["id"], row["target_uid"], row["squad"]
+    old_point, old_color, is_edit, created_at = row["point"], row["color"], row["is_edit"], row["created_at"]
+
+    # ⏰ Проверка таймаута
+    try:
+        created_at_dt = datetime.fromisoformat(created_at)
+    except Exception:
+        created_at_dt = datetime.now()
+
+    if datetime.now() - created_at_dt > timedelta(minutes=5):
+        await db.DB.execute("DELETE FROM pending WHERE id=$1", pending_id)
+        await message.answer("⚠️ Время для назначения задачи истекло (5 минут). Начни заново.")
+        return
+
+    # Проверяем формат
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("⚠ Формат: <точка> <цвет>")
@@ -74,13 +94,11 @@ async def handle_admin_task_message(message: types.Message, bot: Bot):
 
     new_point, new_color = parts[0], parts[1]
 
-    # создаём новую задачу
-    cur = await db.DB.execute(
-        "INSERT INTO tasks(squad, point, color, status) VALUES (?,?,?,?)",
-        (squad, new_point, new_color, TaskStatus.PENDING)
+    rec = await db.DB.fetchrow(
+        "INSERT INTO tasks(squad, point, color, status) VALUES ($1, $2, $3, $4) RETURNING id",
+        squad, new_point, new_color, TaskStatus.PENDING
     )
-    task_id = cur.lastrowid
-    await db.DB.commit()
+    task_id = rec["id"]
 
     # сообщение отряду
     if is_edit:
@@ -98,52 +116,48 @@ async def handle_admin_task_message(message: types.Message, bot: Bot):
             reply_markup=task_keyboard(task_id)
         )
 
-    await db.DB.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
-    await db.DB.execute("DELETE FROM pending WHERE id=?", (pending_id,))
-    await db.DB.commit()
+    await db.DB.execute("UPDATE tasks SET message_id=$1 WHERE id=$2", sent.message_id, task_id)
+    await db.DB.execute("DELETE FROM pending WHERE id=$1", pending_id)
+
+    # убираем кнопку «Отменить назначение»
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     await message.answer(
         f"✅ {'Задача отредактирована' if is_edit else 'Задача создана'} и отправлена {squad}."
     )
 
-
 # ---------------- Редактирование задачи ----------------
 async def edit_task_cmd(message: types.Message):
-    """Команда /edittask — выбор отряда с активными задачами"""
     if not await is_admin(message.from_user.id):
         await message.answer("Нет прав.")
         return
 
-    assert db.DB is not None
-    async with db.DB.execute(
-        "SELECT DISTINCT t.squad FROM tasks t WHERE t.status IN (?, ?)",
-        (TaskStatus.PENDING, TaskStatus.ACCEPTED)
-    ) as cur:
-        squads = [row[0] async for row in cur]
+    rows = await db.DB.fetch(
+        "SELECT DISTINCT t.squad FROM tasks t WHERE t.status IN ($1, $2)",
+        TaskStatus.PENDING, TaskStatus.ACCEPTED
+    )
+    squads = [r["squad"] for r in rows]
 
     if not squads:
         await message.answer("⚠ Активных задач нет.")
         return
 
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=s, callback_data=f"edit_squad:{s}")] for s in squads
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text=s, callback_data=f"edit_squad:{s}")] for s in squads]
     )
     await message.answer("Выбери отряд для корректировки задач:", reply_markup=kb)
 
 
 async def edit_task_choose_squad(callback: CallbackQuery):
-    """Выбор отряда → список его задач"""
     squad = callback.data.split(":")[1]
-    assert db.DB is not None
 
-    async with db.DB.execute(
-        "SELECT t.id, t.point, t.color FROM tasks t "
-        "WHERE t.squad=? AND t.status IN (?, ?)",
-        (squad, TaskStatus.PENDING, TaskStatus.ACCEPTED)
-    ) as cur:
-        rows = await cur.fetchall()
+    rows = await db.DB.fetch(
+        "SELECT t.id, t.point, t.color FROM tasks t WHERE t.squad=$1 AND t.status IN ($2, $3)",
+        squad, TaskStatus.PENDING, TaskStatus.ACCEPTED
+    )
 
     if not rows:
         await callback.message.answer("⚠ У этого отряда нет активных задач.")
@@ -151,8 +165,8 @@ async def edit_task_choose_squad(callback: CallbackQuery):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"{point} ({color})", callback_data=f"edit_task:{task_id}")]
-            for task_id, point, color in rows
+            [InlineKeyboardButton(text=f"{row['point']} ({row['color']})", callback_data=f"edit_task:{row['id']}")]
+            for row in rows
         ]
     )
     await callback.message.edit_text(f"Выбери задачу отряда {squad} для редактирования:", reply_markup=kb)
@@ -165,43 +179,33 @@ async def edit_task_select(callback: CallbackQuery, bot: Bot):
         return
 
     task_id = int(callback.data.split(":")[1])
-    assert db.DB is not None
 
-    # достаём данные старой задачи
-    async with db.DB.execute(
+    row = await db.DB.fetchrow(
         "SELECT t.message_id, u.tg_id, t.point, t.color, t.squad "
-        "FROM tasks t JOIN users u ON u.squad = t.squad WHERE t.id=?",
-        (task_id,)
-    ) as cur:
-        row = await cur.fetchone()
-
+        "FROM tasks t JOIN users u ON u.squad = t.squad WHERE t.id=$1",
+        task_id
+    )
     if not row:
         await callback.answer("⚠ Задача не найдена.")
         return
 
-    msg_id, user_id, old_point, old_color, squad = row
+    msg_id, user_id = row["message_id"], row["tg_id"]
+    old_point, old_color, squad = row["point"], row["color"], row["squad"]
 
-    # убираем у юзера кнопки "Принять" для старой задачи
     try:
         await bot.edit_message_reply_markup(chat_id=user_id, message_id=msg_id, reply_markup=None)
     except Exception:
         pass
 
-    # архивируем старую задачу
-    await db.DB.execute("UPDATE tasks SET status=? WHERE id=?", (TaskStatus.ARCHIVED, task_id))
+    await db.DB.execute("UPDATE tasks SET status=$1 WHERE id=$2", TaskStatus.ARCHIVED, task_id)
 
-    # создаём новую запись в pending с отметкой, что это редактирование
     await db.DB.execute(
-        """
-        INSERT INTO pending (admin_id, target_uid, point, color, squad, created_at, is_edit)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-        """,
-        (callback.from_user.id, user_id, old_point, old_color, squad,
-         datetime.now().isoformat(timespec="seconds"))
+        "INSERT INTO pending (admin_id, target_uid, point, color, squad, created_at, is_edit) "
+        "VALUES ($1, $2, $3, $4, $5, $6, TRUE)",
+        callback.from_user.id, user_id, old_point, old_color, squad,
+        datetime.now().isoformat(timespec="seconds")
     )
-    await db.DB.commit()
 
-    # сообщение администратору
     await callback.message.edit_text(
         "✏ Введи новую цель в формате: `<точка> <цвет>`.",
         parse_mode="Markdown"
@@ -211,34 +215,27 @@ async def edit_task_select(callback: CallbackQuery, bot: Bot):
 
 # ---------------- Принятие задачи ----------------
 async def accept_task(callback: CallbackQuery, bot: Bot):
-    """Юзер принимает задачу"""
     task_id = int(callback.data.split(":")[1])
     start_time = now_hm()
-    assert db.DB is not None
 
-    async with db.DB.execute(
+    row = await db.DB.fetchrow(
         "SELECT t.squad, t.point, t.color, t.message_id, u.tg_id "
         "FROM tasks t JOIN users u ON u.squad = t.squad "
-        "WHERE t.id=? AND t.status=?",
-        (task_id, TaskStatus.PENDING)
-    ) as cur:
-        task = await cur.fetchone()
-
-    if not task or task[3] != callback.message.message_id:
+        "WHERE t.id=$1 AND t.status=$2",
+        task_id, TaskStatus.PENDING
+    )
+    if not row or row["message_id"] != callback.message.message_id:
         await callback.answer("⚠ Эта задача больше не актуальна.", show_alert=True)
         return
 
-    squad, point, color, _, user_id = task
+    squad, point, color, user_id = row["squad"], row["point"], row["color"], row["tg_id"]
 
-    # обновляем задачу → теперь она принята
     await db.DB.execute(
-        "UPDATE tasks SET start_time=?, status=? WHERE id=?",
-        (start_time, TaskStatus.ACCEPTED, task_id)
+        "UPDATE tasks SET start_time=$1, status=$2 WHERE id=$3",
+        start_time, TaskStatus.ACCEPTED, task_id
     )
 
-    # пересчёт статуса отряда
     await update_user_status(user_id)
-    await db.DB.commit()
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -259,22 +256,21 @@ async def accept_task(callback: CallbackQuery, bot: Bot):
 
 # ---------------- Готовность ----------------
 async def set_ready(callback: CallbackQuery, bot: Bot):
-    """Отметить отряд готовым"""
-    assert db.DB is not None
-    async with db.DB.execute(
-        "SELECT u.squad, u.bow, u.arrow FROM users u WHERE u.tg_id=?",
-        (callback.from_user.id,)
-    ) as cur:
-        row = await cur.fetchone()
+    row = await db.DB.fetchrow(
+        "SELECT u.squad, u.bow, u.arrow FROM users u WHERE u.tg_id=$1",
+        callback.from_user.id
+    )
     if not row:
         await callback.message.answer("Сначала введи код отряда.")
         return
 
-    squad, bow, arrow = row
+    squad, bow, arrow = row["squad"], row["bow"], row["arrow"]
 
-    # при ручной готовности — пересчёт статуса
-    await update_user_status(callback.from_user.id)
-    await db.DB.commit()
+    # 👇 вручную ставим готовность
+    await db.DB.execute(
+        "UPDATE users SET ready=TRUE, status='idle' WHERE tg_id=$1",
+        callback.from_user.id
+    )
 
     await notify_admins(bot, f"✅ Отряд {squad} готов к работе\nПтица: {bow}\nСнаряд: {arrow}")
 
@@ -287,3 +283,13 @@ async def set_ready(callback: CallbackQuery, bot: Bot):
         await callback.message.edit_text("Ты отметил готовность ✅")
     except Exception:
         pass
+
+
+async def cancel_task(callback: CallbackQuery):
+    """Отмена назначения задачи"""
+    await db.DB.execute(
+        "DELETE FROM pending WHERE admin_id=$1",
+        callback.from_user.id
+    )
+    await callback.message.edit_text("❌ Назначение задачи отменено.")
+    await callback.answer()

@@ -1,5 +1,4 @@
 from aiogram import Bot, types
-from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from utils import notify_admins, generate_code, update_admin_commands, reset_user_commands
 from db import is_admin
@@ -12,9 +11,8 @@ async def add_admin(message: types.Message, bot: Bot):
     assert db.DB is not None
 
     # Проверяем, что команду вызвал именно главный админ
-    async with db.DB.execute("SELECT is_main FROM admins WHERE tg_id=?", (message.from_user.id,)) as cur:
-        row = await cur.fetchone()
-    if not row or row[0] != 1:
+    row = await db.DB.fetchrow("SELECT is_main FROM admins WHERE tg_id=$1", message.from_user.id)
+    if not row or not row["is_main"]:
         await message.answer("❌ Только главный админ может назначать новых админов.")
         return
 
@@ -25,16 +23,15 @@ async def add_admin(message: types.Message, bot: Bot):
 
     new_admin_id = int(args[1])
 
-    # 🚫 Запрет: главный админ не может назначить сам себя
     if new_admin_id == message.from_user.id:
         await message.answer("❌ Ты уже главный админ, нельзя назначить самого себя.")
         return
 
     # 🚫 Запрет: нельзя назначить отряд админом
-    async with db.DB.execute("SELECT 1 FROM users WHERE tg_id=?", (new_admin_id,)) as cur:
-        if await cur.fetchone():
-            await message.answer("❌ Отряд не может быть назначен админом.")
-            return
+    row = await db.DB.fetchrow("SELECT 1 FROM users WHERE tg_id=$1", new_admin_id)
+    if row:
+        await message.answer("❌ Отряд не может быть назначен админом.")
+        return
 
     # пробуем получить username
     try:
@@ -43,16 +40,14 @@ async def add_admin(message: types.Message, bot: Bot):
     except Exception:
         username = None
 
-    import random, string
     name = username or random.choice(["Орел", "Ястреб", "Сокол", "Волк", "Тигр"]) + "-" + ''.join(random.choices(string.ascii_uppercase, k=3))
 
     await db.DB.execute(
-        "INSERT OR REPLACE INTO admins (tg_id, name, is_main) VALUES (?, ?, 0)",
-        (new_admin_id, name)
+        "INSERT INTO admins (tg_id, name, is_main) VALUES ($1, $2, FALSE) "
+        "ON CONFLICT (tg_id) DO UPDATE SET name=EXCLUDED.name",
+        new_admin_id, name
     )
-    await db.DB.commit()
 
-    # 👇 Теперь корректный вызов
     try:
         await update_admin_commands(bot, new_admin_id)
     except Exception as e:
@@ -65,26 +60,20 @@ async def add_admin(message: types.Message, bot: Bot):
 async def del_admin_cmd(message: types.Message):
     assert db.DB is not None
 
-    # Только главный админ
-    async with db.DB.execute("SELECT is_main FROM admins WHERE tg_id=?", (message.from_user.id,)) as cur:
-        row = await cur.fetchone()
-    if not row or row[0] != 1:
+    row = await db.DB.fetchrow("SELECT is_main FROM admins WHERE tg_id=$1", message.from_user.id)
+    if not row or not row["is_main"]:
         await message.answer("❌ Только главный админ может удалять администраторов.")
         return
 
-    # список всех админов, кроме главного
-    async with db.DB.execute("SELECT tg_id, name FROM admins WHERE is_main=0") as cur:
-        admins = await cur.fetchall()
-
+    admins = await db.DB.fetch("SELECT tg_id, name FROM admins WHERE is_main=FALSE")
     if not admins:
         await message.answer("⚠ Других админов нет.")
         return
 
-    # клавиатура
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"{name or 'Безымянный'} ({uid})", callback_data=f"deladm:{uid}")]
-            for uid, name in admins
+            [InlineKeyboardButton(text=f"{adm['name'] or 'Безымянный'} ({adm['tg_id']})", callback_data=f"deladm:{adm['tg_id']}")]
+            for adm in admins
         ]
     )
     await message.answer("Выбери админа для удаления:", reply_markup=kb)
@@ -93,8 +82,7 @@ async def del_admin_cmd(message: types.Message):
 async def del_admin_cb(callback: CallbackQuery, bot: Bot):
     removed_id = int(callback.data.split(":")[1])
 
-    await db.DB.execute("DELETE FROM admins WHERE tg_id=?", (removed_id,))
-    await db.DB.commit()
+    await db.DB.execute("DELETE FROM admins WHERE tg_id=$1", removed_id)
 
     try:
         await reset_user_commands(bot, removed_id)
@@ -113,15 +101,13 @@ async def list_admins(message: types.Message):
         await message.answer("Нет прав.")
         return
 
-    assert db.DB is not None
-    async with db.DB.execute("SELECT tg_id, name FROM admins") as cur:
-        rows = await cur.fetchall()
+    rows = await db.DB.fetch("SELECT tg_id, name FROM admins")
 
     if not rows:
         await message.answer("Админов пока нет.")
     else:
         text = "👑 Список админов:\n\n" + "\n".join(
-            f"{r[0]}{(' — ' + r[1]) if r[1] else ''}" for r in rows
+            f"{r['tg_id']}{(' — ' + r['name']) if r['name'] else ''}" for r in rows
         )
         await message.answer(text)
 
@@ -131,24 +117,23 @@ async def show_ready_squads(message: types.Message):
         await message.answer("Нет прав.")
         return
 
-    assert db.DB is not None
-    async with db.DB.execute("""
+    rows = await db.DB.fetch("""
         SELECT u.squad, u.bow, u.arrow
         FROM users u
-        WHERE u.ready=1
-    """) as cur:
-        rows = await cur.fetchall()
+        WHERE u.ready=TRUE
+    """)
 
     if not rows:
         await message.answer("Нет готовых отрядов.")
         return
 
-    text = "📋 Готовые отряды:\n\n" + "\n".join(
-        f"{squad} | Птица: {bow or '—'} | Снаряд: {arrow or '—'}"
-        for squad, bow, arrow in rows
+    text = "📋 Готовые отряды:\n\n"
+    text += "\n".join(
+        f"{row['squad']} | Птица: {row['bow'] or '—'} | Снаряд: {row['arrow'] or '—'}"
+        for row in rows
     )
-    await message.answer(text)
 
+    await message.answer(text)
 
 
 async def show_active_tasks(message: types.Message):
@@ -156,24 +141,21 @@ async def show_active_tasks(message: types.Message):
         await message.answer("Нет прав.")
         return
 
-    assert db.DB is not None
-    async with db.DB.execute(
+    rows = await db.DB.fetch(
         "SELECT squad, point, color, start_time, status "
-        "FROM tasks WHERE status = ?",
-        (TaskStatus.ACCEPTED,)
-    ) as cur:
-        rows = await cur.fetchall()
+        "FROM tasks WHERE status = $1",
+        TaskStatus.ACCEPTED
+    )
 
     if not rows:
         await message.answer("Активных задач нет.")
     else:
         lines = []
-        for squad, point, color, start_time, status in rows:
-            status_emoji = "⏳" if status == TaskStatus.PENDING else "✅"
+        for row in rows:
+            status_emoji = "⏳" if row["status"] == TaskStatus.PENDING else "✅"
             lines.append(
-                f"{status_emoji} {squad} → {point} ({color}) | старт: {start_time or '—'}"
+                f"{status_emoji} {row['squad']} → {row['point']} ({row['color']}) | старт: {row['start_time'] or '—'}"
             )
-
         text = "🔥 Активные задачи:\n\n" + "\n".join(lines)
         await message.answer(text)
 
@@ -198,9 +180,8 @@ async def add_user(message: types.Message, bot: Bot):
         await message.answer("❌ Ты не можешь назначить себя отрядом.")
         return
 
-    async with db.DB.execute("SELECT is_main FROM admins WHERE tg_id=?", (new_tg_id,)) as cur:
-        row = await cur.fetchone()
-    if row and row[0] == 1:
+    row = await db.DB.fetchrow("SELECT is_main FROM admins WHERE tg_id=$1", new_tg_id)
+    if row and row["is_main"]:
         await message.answer("❌ Главный админ не может быть назначен отрядом.")
         return
 
@@ -208,11 +189,11 @@ async def add_user(message: types.Message, bot: Bot):
     code = generate_code(squad_name)
 
     await db.DB.execute(
-        "INSERT OR REPLACE INTO users (tg_id, squad, code, bow, arrow, ready, status) "
-        "VALUES (?, ?, ?, NULL, NULL, 0, 'idle')",
-        (new_tg_id, squad_name, code)
+        "INSERT INTO users (tg_id, squad, code, bow, arrow, ready, status) "
+        "VALUES ($1, $2, $3, NULL, NULL, FALSE, 'idle') "
+        "ON CONFLICT (tg_id) DO UPDATE SET squad=EXCLUDED.squad, code=EXCLUDED.code",
+        new_tg_id, squad_name, code
     )
-    await db.DB.commit()
 
     await notify_admins(bot, f"👤 Новый отряд добавлен: {squad_name} (ID {new_tg_id})")
 

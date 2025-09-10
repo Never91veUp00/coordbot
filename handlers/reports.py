@@ -1,59 +1,31 @@
 from aiogram import Bot, types
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.filters import StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from keyboards import report_keyboard, ready_kb
 from utils import notify_admins, now_hm, make_report, update_user_status
 from enums import TaskStatus
 import db
 
-
-# ---------------- Список моих задач ----------------
-async def my_tasks(message: types.Message):
-    uid = message.from_user.id
-    assert db.DB is not None
-
-    async with db.DB.execute("SELECT squad FROM users WHERE tg_id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    if not row:
-        await message.answer("⚠ Ты не зарегистрирован в системе.")
-        return
-    squad = row[0]
-
-    async with db.DB.execute(
-        "SELECT id, point, color, status FROM tasks "
-        "WHERE squad=? AND status IN (?, ?) ORDER BY id",
-        (squad, TaskStatus.PENDING, TaskStatus.ACCEPTED)
-    ) as cur:
-        tasks = await cur.fetchall()
-
-    if not tasks:
-        await message.answer("У тебя нет задач.")
-        return
-
-    text = "📋 Твои задачи:\n\n"
-    for t in tasks:
-        text += f"{t['status']} — {t['point']} ({t['color']})\n"
-
-    await message.answer(text)
-
+# --- Состояния отчёта ---
+class ReportStates(StatesGroup):
+    await_true_point = State()
 
 # ---------------- Старт отчёта ----------------
 async def report_start(message: types.Message):
     uid = message.from_user.id
-    assert db.DB is not None
-
-    async with db.DB.execute("SELECT squad FROM users WHERE tg_id=?", (uid,)) as cur:
-        row = await cur.fetchone()
+    row = await db.DB.fetchrow("SELECT squad FROM users WHERE tg_id=$1", uid)
     if not row:
         await message.answer("⚠ Ты не зарегистрирован в системе.")
         return
-    squad = row[0]
+    squad = row["squad"]
 
-    async with db.DB.execute(
+    tasks = await db.DB.fetch(
         "SELECT id, point, color, start_time FROM tasks "
-        "WHERE squad=? AND status=?",
-        (squad, TaskStatus.ACCEPTED)
-    ) as cur:
-        tasks = await cur.fetchall()
+        "WHERE squad=$1 AND status=$2",
+        squad, TaskStatus.ACCEPTED
+    )
 
     if not tasks:
         await message.answer("⚠ У тебя нет активных задач для отчёта.")
@@ -62,9 +34,9 @@ async def report_start(message: types.Message):
     if len(tasks) == 1:
         task = tasks[0]
         await message.answer(
-            f"📋 Активная задача #{task[0]}:\n"
-            f"Цель: {task[1]} ({task[2]})\nНачало: {task[3]}\n\nВыбери результат:",
-            reply_markup=report_keyboard(task_id=task[0])
+            f"📋 Активная задача #{task['id']}:\n"
+            f"Цель: {task['point']} ({task['color']})\nНачало: {task['start_time']}\n\nВыбери результат:",
+            reply_markup=report_keyboard(task_id=task["id"])
         )
         return
 
@@ -82,41 +54,62 @@ async def report_start(message: types.Message):
 # ---------------- Выбор задачи ----------------
 async def choose_task(callback: CallbackQuery):
     task_id = int(callback.data.split(":")[1])
-    assert db.DB is not None
 
-    async with db.DB.execute(
-        "SELECT point, color, start_time FROM tasks WHERE id=?",
-        (task_id,)
-    ) as cur:
-        task = await cur.fetchone()
-
+    task = await db.DB.fetchrow(
+        "SELECT point, color, start_time FROM tasks WHERE id=$1",
+        task_id
+    )
     if not task:
         await callback.message.answer("⚠ Задача не найдена.")
         return
 
     await callback.message.edit_text(
         f"📋 Задача #{task_id}:\n"
-        f"Цель: {task[0]} ({task[1]})\nНачало: {task[2]}\n\nВыбери результат:",
+        f"Цель: {task['point']} ({task['color']})\nНачало: {task['start_time']}\n\nВыбери результат:",
         reply_markup=report_keyboard(task_id=task_id)
     )
     await callback.answer()
 
 
 # ---------------- Приём результата ----------------
-async def handle_report(callback: CallbackQuery):
+
+async def handle_report(callback: CallbackQuery, state: FSMContext):
     _, task_id, chosen = callback.data.split(":")
     task_id = int(task_id)
-
-    result_map = {"hit": "✅ Попадание", "miss": "❌ Промах", "skip": "⏸ Не выполнил"}
-    result = result_map.get(chosen)
     end_time = now_hm()
 
-    assert db.DB is not None
+    if chosen == "other":
+        # 👇 ставим заглушку, ждём уточнения
+        await db.DB.execute(
+            "UPDATE tasks SET await_video=FALSE, result=$1, end_time=$2 WHERE id=$3",
+            "🎯 Попал в другую точку", end_time, task_id
+        )
+        await db.DB.execute(
+            "UPDATE tasks SET report=$1 WHERE id=$2",
+            "Ожидается ввод реального попадания...", task_id
+        )
+        
+        # переводим пользователя в состояние ожидания реальной точки
+        await state.set_state(ReportStates.await_true_point)
+
+        await callback.message.edit_text(
+            "✏ Укажи, в какую именно точку и цвет ты попал (например: 3 красный)."
+        )
+        await callback.answer()
+        return
+
+    # остальные варианты
+    result_map = {
+        "hit": "✅ Попадание",
+        "miss": "❌ Промах",
+        "skip": "⏸ Не выполнил"
+    }
+    result = result_map.get(chosen)
+
     await db.DB.execute(
-        "UPDATE tasks SET end_time=?, result=?, await_video=1 WHERE id=?",
-        (end_time, result, task_id)
+        "UPDATE tasks SET end_time=$1, result=$2, await_video=TRUE WHERE id=$3",
+        end_time, result, task_id
     )
-    await db.DB.commit()
 
     await callback.message.edit_text(
         "Отчет принят.\nПришли видео (оно будет приложено с подписью).",
@@ -125,6 +118,62 @@ async def handle_report(callback: CallbackQuery):
         ])
     )
     await callback.answer()
+
+
+async def handle_true_point(message: types.Message, state: FSMContext):
+    # если по какой-то причине не в нужном состоянии — выходим молча
+    if await state.get_state() != ReportStates.await_true_point.state:
+        return
+
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    # Ищем задачу, которая ждёт уточнения
+    row = await db.DB.fetchrow(
+        """
+        SELECT t.id
+        FROM tasks t
+        JOIN users u ON u.squad = t.squad
+        WHERE u.tg_id=$1
+          AND t.result LIKE '🎯%'
+          AND t.await_video=FALSE
+        ORDER BY t.id DESC
+        LIMIT 1
+        """,
+        uid
+    )
+
+    if not row:
+        # сбросим состояние на всякий случай и выйдем
+        await state.clear()
+        return
+
+    task_id = row["id"]
+
+    # Разбор "A3 красный"
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("⚠ Формат: <точка> <цвет> (например: A3 красный)")
+        return
+
+    true_point, true_color = parts[0], parts[1]
+
+    # Сохраняем уточнённую цель
+    await db.DB.execute(
+        "UPDATE tasks SET true_point=$1, true_color=$2, await_video=TRUE WHERE id=$3",
+        true_point, true_color, task_id
+    )
+
+    # очищаем состояние
+    await state.clear()
+
+    # Сообщаем пользователю
+    await message.answer(
+        f"✅ Принято ({true_point} {true_color}). Теперь пришли видео (или выбери «Видео не будет»).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎥 Видео не будет", callback_data=f"novideo:{task_id}")]
+        ])
+    )
 
 
 # ---------------- Отказ от видео ----------------
@@ -147,43 +196,37 @@ async def confirm_no_video(callback: CallbackQuery, bot: Bot):
     """Отчёт без видео"""
     task_id = int(callback.data.split(":")[1])
     uid = callback.from_user.id
-    assert db.DB is not None
 
-    async with db.DB.execute(
+    row = await db.DB.fetchrow(
         """
-        SELECT u.squad, u.bow, u.arrow, t.point, t.color, t.start_time,
-               COALESCE(t.result, 'без указания')
+        SELECT u.squad, u.bow, u.arrow, t.point, t.color, t.true_point, t.true_color, t.start_time, COALESCE(t.result, 'без указания') AS result
         FROM tasks t
         JOIN users u ON u.squad = t.squad
-        WHERE t.id=? AND u.tg_id=? AND t.await_video=1
+        WHERE t.id=$1 AND u.tg_id=$2 AND t.await_video=TRUE
         """,
-        (task_id, uid)
-    ) as cur:
-        task = await cur.fetchone()
-
-    if not task:
+        task_id, uid
+    )
+    if not row:
         await callback.message.answer("⚠ Задача не найдена.")
         return
 
-    squad, bow, arrow, point, color, start_time, result = task
+    squad, bow, arrow = row["squad"], row["bow"], row["arrow"]
+    point, color, start_time, result = row["point"], row["color"], row["start_time"], row["result"]
+    true_point, true_color = row["true_point"], row["true_color"]
     end_time = now_hm()
 
     final_report = make_report(
         squad, bow, arrow, point, color, start_time, end_time,
-        result, video_attached=False
+        result, video_attached=False,
+        true_point=true_point, true_color=true_color
     )
 
-    # закрываем задачу
     await db.DB.execute(
-        "UPDATE tasks SET status=?, report=?, end_time=?, video_attached=0, await_video=0 WHERE id=?",
-        (TaskStatus.FINISHED, final_report, end_time, task_id)
+        "UPDATE tasks SET status=$1, report=$2, end_time=$3, video_attached=FALSE, await_video=FALSE WHERE id=$4",
+        TaskStatus.FINISHED, final_report, end_time, task_id
     )
-    await db.DB.commit()
 
-    # пересчитываем статус пользователя
     await update_user_status(uid)
-    await db.DB.commit()
-
     await notify_admins(bot, final_report)
 
     await callback.message.edit_text("✅ Отчет зафиксирован без видео.")

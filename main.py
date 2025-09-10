@@ -1,12 +1,13 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from config import TOKEN
 from db import init_db, close_db, migrate
 from handlers import admin, user, registration, tasks, reports, files
 from utils import set_commands
 from filters import IsNotAdminFilter, IsAdminMessageFilter
+from export_excel import listen_for_updates, main as export_main
 
 
 def register_handlers(dp: Dispatcher):
@@ -28,12 +29,16 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(admin.add_user, Command("adduser"))
 
     # ---------------- User
+    dp.message.register(user.finish_cmd, Command("finish"))
+    dp.message.register(user.my_tasks, Command("mytasks"))
     dp.message.register(user.start_cmd, Command("start"))
     dp.message.register(user.reconfig, Command("config"))
     dp.message.register(user.my_id, Command("myid"))
     dp.message.register(user.support_cmd, Command("support"))
     dp.callback_query.register(user.set_bow, lambda c: c.data.startswith("bow:"))
     dp.callback_query.register(user.set_arrow, lambda c: c.data.startswith("arrow:"))
+
+    dp.message.register(reports.handle_true_point, StateFilter(reports.ReportStates.await_true_point))
 
     # ---------------- Registration
     dp.message.register(registration.handle_registration, IsNotAdminFilter(), F.text & ~F.text.startswith("/"))
@@ -48,11 +53,11 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(tasks.handle_admin_task_message, IsAdminMessageFilter())
     dp.callback_query.register(tasks.edit_task_choose_squad, lambda c: c.data.startswith("edit_squad:"))
     dp.callback_query.register(tasks.edit_task_select, lambda c: c.data.startswith("edit_task:"))
+    dp.callback_query.register(tasks.cancel_task, lambda c: c.data == "cancel_task")
     dp.callback_query.register(tasks.accept_task, lambda c: c.data.startswith("accept:"))
     dp.callback_query.register(tasks.set_ready, lambda c: c.data == "ready")
 
     # ---------------- Reports
-    dp.message.register(reports.my_tasks, Command("mytasks"))
     dp.message.register(reports.report_start, Command("report"))
     dp.callback_query.register(reports.choose_task, lambda c: c.data.startswith("choose_task:"))
     dp.callback_query.register(reports.handle_report, lambda c: c.data.startswith("report:"))
@@ -77,6 +82,10 @@ async def main():
 
     # Команды
     await set_commands(bot)
+
+    # Экспорт Excel
+    await export_main()  # первый раз сформируем отчёт при старте
+    asyncio.create_task(listen_for_updates())  # слушаем изменения в tasks
 
     logging.info("✅ Бот запущен")
     try:

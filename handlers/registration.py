@@ -12,34 +12,30 @@ async def handle_registration(message: types.Message, bot: Bot):
         return
 
     # Проверяем, зарегистрирован ли уже
-    async with db.DB.execute("SELECT 1 FROM users WHERE tg_id=?", (message.from_user.id,)) as cur:
-        exists = await cur.fetchone()
+    exists = await db.DB.fetchrow("SELECT 1 FROM users WHERE tg_id=$1", message.from_user.id)
     if exists:
         return
 
     # Проверяем, есть ли заявка в pending
-    async with db.DB.execute(
-        "SELECT id, squad, phone FROM pending WHERE target_uid=? ORDER BY created_at DESC LIMIT 1",
-        (message.from_user.id,)
-    ) as cur:
-        row = await cur.fetchone()
+    row = await db.DB.fetchrow(
+        "SELECT id, squad, phone FROM pending WHERE target_uid=$1 ORDER BY created_at DESC LIMIT 1",
+        message.from_user.id
+    )
 
     if not row:
         # первая запись
         await db.DB.execute(
-            "INSERT INTO pending (admin_id, target_uid, squad, created_at) VALUES (?, ?, ?, ?)",
-            (0, message.from_user.id, text, datetime.now().isoformat(timespec="seconds"))
+            "INSERT INTO pending (admin_id, target_uid, squad, created_at) VALUES ($1, $2, $3, $4)",
+            0, message.from_user.id, text, datetime.now().isoformat(timespec="seconds")
         )
-        await db.DB.commit()
         await message.answer("📞 Теперь введи номер телефона для связи (например, +79998887766):")
         return
 
-    pending_id, squad, phone = row
+    pending_id, squad, phone = row["id"], row["squad"], row["phone"]
 
     if not squad:
         # 👈 сюда попадает после register_request
-        await db.DB.execute("UPDATE pending SET squad=? WHERE id=?", (text, pending_id))
-        await db.DB.commit()
+        await db.DB.execute("UPDATE pending SET squad=$1 WHERE id=$2", text, pending_id)
         await message.answer("📞 Теперь введи номер телефона для связи (например, +79998887766):")
         return
 
@@ -51,12 +47,11 @@ async def handle_registration(message: types.Message, bot: Bot):
             await message.answer("⚠ Некорректный номер телефона. Укажи его в международном формате (например, +79998887766).")
             return
 
-        await db.DB.execute("UPDATE pending SET phone=? WHERE id=?", (phone_norm, pending_id))
-        await db.DB.commit()
+        await db.DB.execute("UPDATE pending SET phone=$1 WHERE id=$2", phone_norm, pending_id)
 
         # Отправляем заявку всем админам
         ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[ 
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Зарегистрировать", callback_data=f"approve:{pending_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{pending_id}")
         ]])
@@ -83,36 +78,35 @@ async def handle_registration(message: types.Message, bot: Bot):
 async def register_request(callback: CallbackQuery):
     await callback.message.edit_text("✏ Введи название своего отряда одним сообщением.")
     await db.DB.execute(
-        "INSERT OR REPLACE INTO pending (admin_id, target_uid, created_at) VALUES (?, ?, ?)",
-        (0, callback.from_user.id, datetime.now().isoformat(timespec="seconds"))
+        "INSERT INTO pending (admin_id, target_uid, created_at) VALUES ($1, $2, $3) "
+        "ON CONFLICT (target_uid) DO UPDATE SET created_at=EXCLUDED.created_at",
+        0, callback.from_user.id, datetime.now().isoformat(timespec="seconds")
     )
-    await db.DB.commit()
     await callback.answer()
 
 
 async def approve_user(callback: CallbackQuery, bot: Bot):
     pending_id = int(callback.data.split(":")[1])
 
-    async with db.DB.execute(
-        "SELECT target_uid, squad, phone FROM pending WHERE id=?",
-        (pending_id,)
-    ) as cur:
-        row = await cur.fetchone()
+    row = await db.DB.fetchrow(
+        "SELECT target_uid, squad, phone FROM pending WHERE id=$1",
+        pending_id
+    )
 
     if not row:
         await callback.answer("⚠ Заявка не найдена.")
         return
 
-    uid, squad_name, phone = row
+    uid, squad_name, phone = row["target_uid"], row["squad"], row["phone"]
     code = generate_code(squad_name)
 
     await db.DB.execute(
-        "INSERT OR REPLACE INTO users (tg_id, squad, code, bow, arrow, ready, status) "
-        "VALUES (?, ?, ?, NULL, NULL, 0, 'idle')",
-        (uid, squad_name, code)
+        "INSERT INTO users (tg_id, squad, code, bow, arrow, ready, status) "
+        "VALUES ($1, $2, $3, NULL, NULL, FALSE, 'idle') "
+        "ON CONFLICT (tg_id) DO UPDATE SET squad=EXCLUDED.squad, code=EXCLUDED.code",
+        uid, squad_name, code
     )
-    await db.DB.execute("DELETE FROM pending WHERE id=?", (pending_id,))
-    await db.DB.commit()
+    await db.DB.execute("DELETE FROM pending WHERE id=$1", pending_id)
 
     # уведомляем пользователя
     try:
@@ -141,7 +135,7 @@ async def approve_user(callback: CallbackQuery, bot: Bot):
         f"Отряд: <b>{squad_name}</b>\n"
         f"ID: <a href=\"tg://user?id={uid}\">{uid}</a>\n"
         f"☎ Телефон: <a href=\"tel:{phone}\">{phone}</a>",
-        exclude=[callback.from_user.id]   # 👈 исключаем текущего
+        exclude=[callback.from_user.id]
     )
 
     await callback.answer()
@@ -150,16 +144,14 @@ async def approve_user(callback: CallbackQuery, bot: Bot):
 async def reject_user(callback: CallbackQuery, bot: Bot):
     pending_id = int(callback.data.split(":")[1])
 
-    async with db.DB.execute("SELECT target_uid FROM pending WHERE id=?", (pending_id,)) as cur:
-        row = await cur.fetchone()
+    row = await db.DB.fetchrow("SELECT target_uid FROM pending WHERE id=$1", pending_id)
 
     if not row:
         await callback.answer("⚠ Заявка не найдена.")
         return
 
-    uid = row[0]
-    await db.DB.execute("DELETE FROM pending WHERE id=?", (pending_id,))
-    await db.DB.commit()
+    uid = row["target_uid"]
+    await db.DB.execute("DELETE FROM pending WHERE id=$1", pending_id)
 
     try:
         await bot.send_message(
